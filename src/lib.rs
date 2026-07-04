@@ -779,10 +779,12 @@ async fn perform_client_handshake<R: AsyncRead + Unpin>(
     let mut new_nonce = [0u8; 32];
     rand::thread_rng().fill(&mut new_nonce);
 
-    let pq_val = 2342281u64;
-    let p_val = 1721u64;
-    let q_val = 1361u64;
-    let pq_bytes = big_endian_minimal(pq_val);
+    // Factor the server-issued pq (MTProto proof-of-work). Echo pq exactly as
+    // received; send p and q (p < q) as minimal big-endian.
+    let pq_bytes = res_pq.pq.clone();
+    let pq_val = be_bytes_to_u64(&pq_bytes)?;
+    let (p_val, q_val) = crypto_dh::factorize_pq(pq_val)
+        .ok_or_else(|| anyhow!("Failed to factor server pq {}", pq_val))?;
     let p_bytes = big_endian_minimal(p_val);
     let q_bytes = big_endian_minimal(q_val);
 
@@ -843,6 +845,16 @@ async fn perform_client_handshake<R: AsyncRead + Unpin>(
     let p_dh = BigUint::from_bytes_be(&dh_data.dh_prime);
     let g_dh = BigUint::from(dh_data.g as u64);
     let g_a = BigUint::from_bytes_be(&dh_data.g_a);
+
+    // Validate dh_prime and g against the known-good safe prime, exactly as real
+    // clients do (they never trust an unverified prime from the server).
+    let expected_dh = crypto_dh::DHParams::default();
+    if p_dh != expected_dh.dh_prime {
+        return Err(anyhow!("server dh_prime is not the expected safe prime"));
+    }
+    if dh_data.g as u32 != expected_dh.g {
+        return Err(anyhow!("unexpected DH generator g={}", dh_data.g));
+    }
 
     validate_g_a(&g_a, &p_dh)?;
 
@@ -929,14 +941,9 @@ async fn perform_client_handshake<R: AsyncRead + Unpin>(
         }
         i64::from_le_bytes(s)
     };
-    // Session id is derived deterministically from the handshake nonces so it
-    // matches the server without being transmitted (see server compute_session_id).
-    let session_id = compute_session_id(&new_nonce, &server_nonce);
-
-    // 7. First encrypted message: vpn.config
-    let payload_enc = transport_reader.read_packet(reader).await?;
-    let (ipv4, ipv6) = receive_vpn_config(&payload_enc, &auth_key, auth_key_id, &session_id).await?;
-    info!("Received vpn.config: IPv4={}, IPv6={}", ipv4, ipv6);
+    // Per MTProto the client picks its own random session_id.
+    let mut session_id = [0u8; 8];
+    rand::thread_rng().fill(&mut session_id);
 
     let session = VpnSession {
         auth_key,
@@ -946,20 +953,42 @@ async fn perform_client_handshake<R: AsyncRead + Unpin>(
         server_seq_no: Mutex::new(1),
     };
 
+    // 7. Client speaks first on the encrypted channel: send vpn.getConfig; the
+    // server learns our session_id from it and answers with vpn.config wrapped
+    // in an rpc_result. Skip service messages (e.g. new_session_created).
+    let getcfg = rpc::serialize_vpn_get_config();
+    send_encrypted(&getcfg, &session, true, write_tx).await?;
+
+    let (ipv4, ipv6) = loop {
+        let payload_enc = transport_reader.read_packet(reader).await?;
+        if let Some(addrs) = receive_vpn_config(&payload_enc, &session)? {
+            break addrs;
+        }
+    };
+    info!("Received vpn.config: IPv4={}, IPv6={}", ipv4, ipv6);
+
     Ok((session, ipv4, ipv6))
 }
 
-async fn receive_vpn_config(
-    payload: &[u8],
-    auth_key: &[u8; 256],
-    auth_key_id: i64,
-    session_id: &[u8; 8],
-) -> Result<(Ipv4Addr, Ipv6Addr)> {
+/// Convert minimal big-endian bytes (≤ 8) to a u64.
+fn be_bytes_to_u64(b: &[u8]) -> Result<u64> {
+    if b.len() > 8 {
+        return Err(anyhow!("pq value too large: {} bytes", b.len()));
+    }
+    let mut buf = [0u8; 8];
+    buf[8 - b.len()..].copy_from_slice(b);
+    Ok(u64::from_be_bytes(buf))
+}
+
+/// Decrypt a server message during setup, returning the assigned addresses when
+/// it carries the `rpc_result(vpn.config)` reply to our vpn.getConfig, or `None`
+/// for service messages (e.g. new_session_created) that we skip.
+fn receive_vpn_config(payload: &[u8], session: &VpnSession) -> Result<Option<(Ipv4Addr, Ipv6Addr)>> {
     if payload.len() < 24 {
         return Err(anyhow!("Config packet too short"));
     }
     let incoming_key_id = i64::from_le_bytes(payload[0..8].try_into().unwrap());
-    if incoming_key_id != auth_key_id {
+    if incoming_key_id != session.auth_key_id {
         return Err(anyhow!("Config packet auth_key_id mismatch"));
     }
     let mut msg_key = [0u8; 16];
@@ -967,17 +996,26 @@ async fn receive_vpn_config(
     let encrypted_len = (payload.len() - 24) & !15;
     let encrypted_data = &payload[24..24 + encrypted_len];
     // Message sent by the server: direction constant x = 8.
-    let decrypted = crypto_ige::decrypt_message_x(auth_key, &msg_key, encrypted_data, 8)?;
+    let decrypted = crypto_ige::decrypt_message_x(&session.auth_key, &msg_key, encrypted_data, 8)?;
     if decrypted.len() < 32 {
         return Err(anyhow!("Decrypted config too short"));
     }
-    if &decrypted[8..16] != session_id {
+    if &decrypted[8..16] != &session.session_id {
         return Err(anyhow!("Config session ID mismatch"));
     }
     let msg_len = i32::from_le_bytes(decrypted[28..32].try_into().unwrap()) as usize;
+    if decrypted.len() < 32 + msg_len || msg_len < 4 {
+        return Err(anyhow!("Decrypted config size mismatch"));
+    }
     let body = &decrypted[32..32 + msg_len];
-    let (ipv4_bytes, ipv6_bytes) = rpc::parse_vpn_config(body)?;
-    Ok((Ipv4Addr::from(ipv4_bytes), Ipv6Addr::from(ipv6_bytes)))
+    let constructor_id = u32::from_le_bytes(body[0..4].try_into().unwrap());
+    if constructor_id != rpc::RPC_RESULT_CONSTRUCTOR_ID {
+        // new_session_created or other service message — keep waiting.
+        return Ok(None);
+    }
+    let (_req_msg_id, result) = rpc::parse_rpc_result(body)?;
+    let (ipv4_bytes, ipv6_bytes) = rpc::parse_vpn_config(result)?;
+    Ok(Some((Ipv4Addr::from(ipv4_bytes), Ipv6Addr::from(ipv6_bytes))))
 }
 
 fn rsa_pad_encrypt(
@@ -1194,18 +1232,18 @@ static LAST_RESPONSE_MSG_ID: AtomicI64 = AtomicI64::new(0);
 
 /// Strictly-increasing MTProto message id against `last`. High 32 bits carry the
 /// unix time in seconds and the low 32 bits the fractional second (scaled to
-/// 2^32), so ids issued within the same second stay distinct and ordered — the
-/// server rejects any client msg_id that is not greater than the previous one.
+/// 2^32). The low two bits are kept at `0b00`: per MTProto, client-generated
+/// message ids must be ≡ 0 (mod 4).
 fn next_msg_id(last: &AtomicI64) -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
     let secs = now.as_secs() as i64;
     let nanos = now.subsec_nanos() as u64;
     let frac = ((nanos << 32) / 1_000_000_000) as i64 & 0xffff_fffc;
-    let candidate = (secs << 32) | frac | 1;
+    let candidate = (secs << 32) | frac; // low 2 bits already zero
     loop {
         let prev = last.load(Ordering::SeqCst);
-        let target = if candidate > prev { candidate } else { (prev & !3) + 5 };
+        let target = if candidate > prev { candidate } else { (prev & !3) + 4 };
         if last
             .compare_exchange(prev, target, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
@@ -1213,18 +1251,6 @@ fn next_msg_id(last: &AtomicI64) -> i64 {
             return target;
         }
     }
-}
-
-/// Deterministically derive the 8-byte session id shared by both peers from the
-/// handshake nonces. Must match the server's `compute_session_id` exactly.
-fn compute_session_id(new_nonce: &[u8; 32], server_nonce: &[u8; 16]) -> [u8; 8] {
-    let mut h = Sha256Hash::new();
-    h.update(new_nonce);
-    h.update(server_nonce);
-    let digest = h.finalize();
-    let mut id = [0u8; 8];
-    id.copy_from_slice(&digest[0..8]);
-    id
 }
 
 fn compute_new_nonce_hash(new_nonce: &[u8; 32], auth_key: &[u8; 256], hash_num: u8) -> [u8; 16] {
